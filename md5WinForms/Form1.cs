@@ -98,7 +98,8 @@ namespace md5WinForms
                 Invoke(new Action(() =>
                 {
                     TimeSpan elapsed = stopwatch.Elapsed;
-                    string formattedTime = $"{elapsed.Hours}小时 {elapsed.Minutes}分钟 {elapsed.Seconds + elapsed.Milliseconds / 1000.0:F1}秒";
+                    string formattedTime =
+                        $"{elapsed.Hours}小时 {elapsed.Minutes}分钟 {elapsed.Seconds + elapsed.Milliseconds / 1000.0:F1}秒";
                     lblScanTime.Text = $"扫描时间：{formattedTime}";
                     lblMd5Count.Text = $"MD5 相同文件数量：{GetDuplicateMd5Count()}";
                 }));
@@ -130,7 +131,29 @@ namespace md5WinForms
         {
             try
             {
-                string[] files = Directory.GetFiles(folderPath, "*.*", SearchOption.AllDirectories);
+                IEnumerable<string> files = new List<string>();
+
+                try
+                {
+                    // 尝试获取所有子目录中的文件
+                    files = Directory.GetFiles(folderPath, "*.*", SearchOption.AllDirectories);
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    LogError($"将降级为递归扫描目录: {ex.Message}");
+                    files = ScanFilesTopDirectoryOnly(folderPath, token); // 降级为递归扫描
+                }
+                catch (IOException ex)
+                {
+                    LogError($"IO 异常: {ex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    LogError($"其他异常: {ex.Message}");
+                    // 出错时跳过该目录
+                }
+
+                // 将文件加入队列，处理取消令牌
                 foreach (var file in files)
                 {
                     if (token.IsCancellationRequested) break;
@@ -142,6 +165,50 @@ namespace md5WinForms
                 fileQueue.CompleteAdding(); // 通知消费者不再有新的文件
             }
         }
+
+        private IEnumerable<string> ScanFilesTopDirectoryOnly(string folderPath, CancellationToken token)
+        {
+            var files = new List<string>();
+
+            try
+            {
+                // 获取当前目录下的文件
+                files.AddRange(Directory.GetFiles(folderPath, "*.*", SearchOption.TopDirectoryOnly));
+            }
+            catch (Exception ex)
+            {
+                LogError($"降级扫描时发生异常: {ex.Message}");
+                // 跳过该目录
+            }
+
+            // 获取所有子目录并递归扫描
+            try
+            {
+                foreach (var subDirectory in Directory.GetDirectories(folderPath))
+                {
+                    if (token.IsCancellationRequested) break;
+
+                    // 递归获取子目录中的文件
+                    files.AddRange(ScanFilesTopDirectoryOnly(subDirectory, token));
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                LogError($"无法访问子目录: {ex.Message}");
+            }
+            catch (IOException ex)
+            {
+                LogError($"IO 异常: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                LogError($"其他异常: {ex.Message}");
+            }
+
+            return files;
+        }
+
+
 
         // 消费文件队列并将其添加到文件大小队列
         private async Task ProcessFilesizeQueue(CancellationToken token)
@@ -161,6 +228,7 @@ namespace md5WinForms
                         {
                             fileSizeMap[fileSize] = new List<string>();
                         }
+
                         fileSizeMap[fileSize].Add(filePath);
 
                         // 如果文件大小已存在且数量大于1，添加所有文件到文件大小队列
@@ -182,6 +250,7 @@ namespace md5WinForms
                     break;
                 }
             }
+
             filesizeQueue.CompleteAdding(); // 通知消费者不再有新的文件
         }
 
@@ -202,6 +271,7 @@ namespace md5WinForms
                         {
                             md5ToFileMap[md5Hash] = new List<string>();
                         }
+
                         md5ToFileMap[md5Hash].Add(filePath);
                     }
                 }
@@ -228,6 +298,8 @@ namespace md5WinForms
                 stopwatch.Stop();
                 lblStatus.Text = "扫描完成";
                 lblMd5Count.Text = $"MD5 相同文件数量：{GetDuplicateMd5Count()}";
+                // 弹出提示框通知用户扫描完成
+                MessageBox.Show("扫描已完成！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }));
         }
 
@@ -278,6 +350,7 @@ namespace md5WinForms
                 string moreThanTwo = item.SubItems[3].Text;
                 csvContent.AppendLine($"{address1},{address2},{md5},{moreThanTwo}");
             }
+
             File.WriteAllText(filePath, csvContent.ToString());
             MessageBox.Show("MD5 对照表已保存！", "保存成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
