@@ -9,32 +9,33 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using md5WinForms.utils;
 
 namespace md5WinForms
 {
     public partial class Form1 : Form
     {
-        private BlockingCollection<string> fileQueue = new(); // 线程安全队列
-        private BlockingCollection<string> filesizeQueue = new(); // 文件大小队列
-        private Dictionary<long, List<string>> fileSizeMap = new(); // 文件大小映射表
-        private Dictionary<string, List<string>> md5ToFileMap = new(); // MD5映射表
-        private HashSet<string> displayedMd5s = new(); // 已显示的MD5值
+        private BlockingCollection<string> fileQueue = new();
+        private BlockingCollection<string> filesizeQueue = new();
+        private ConcurrentDictionary<long, ConcurrentBag<string>> fileSizeMap = new();
+        private ConcurrentDictionary<string, ConcurrentBag<string>> md5ToFileMap = new();
+        private HashSet<string> displayedMd5s = new();
 
         private CancellationTokenSource cancellationTokenSource;
-        private Stopwatch stopwatch; // 计时器
-        private bool isScanning = false; // 标志扫描状态
+        private Stopwatch stopwatch;
+        private volatile bool isScanning = false;
+        private int activeFileSizeThreads = 0; // 跟踪活跃的文件大小处理线程
 
         public Form1()
         {
             InitializeComponent();
         }
 
-        // 选择U盘目录
         private async void btnSelectFolder_Click(object sender, EventArgs e)
         {
             if (isScanning)
             {
-                await StopPreviousScan(); // 停止上一次扫描
+                await StopPreviousScan();
             }
 
             using var folderBrowserDialog = new FolderBrowserDialog();
@@ -42,47 +43,53 @@ namespace md5WinForms
             {
                 string selectedPath = folderBrowserDialog.SelectedPath;
 
-                ResetData(); // 重置数据
-                ResetUI(); // 重置UI状态
+                ResetData();
+                ResetUI();
 
                 cancellationTokenSource = new CancellationTokenSource();
                 stopwatch = new Stopwatch();
                 isScanning = true;
 
                 lblStatus.Text = "扫描中...";
-                stopwatch.Start(); // 开始计时
+                stopwatch.Start();
 
-                // 启动扫描和状态更新线程
+                // 启动文件扫描
                 Task.Run(() => ScanFiles(selectedPath, cancellationTokenSource.Token));
-                Task.Run(() => ProcessFilesizeQueue(cancellationTokenSource.Token));
+                
+                // 启动文件大小处理线程
+                int numThreads = Environment.ProcessorCount;
+                activeFileSizeThreads = numThreads;
+                for (int i = 0; i < numThreads; i++)
+                {
+                    Task.Run(() => ProcessFilesizeQueue(cancellationTokenSource.Token));
+                }
+
+                // 启动MD5处理和UI更新
                 Task.Run(() => ProcessFiles(cancellationTokenSource.Token));
                 Task.Run(() => UpdateStatusLabels(cancellationTokenSource.Token));
                 Task.Run(() => PeriodicRefreshListView(cancellationTokenSource.Token));
             }
         }
 
-        // 停止上一次扫描任务
         private async Task StopPreviousScan()
         {
-            cancellationTokenSource?.Cancel(); // 取消任务
-            stopwatch?.Stop(); // 停止计时
+            cancellationTokenSource?.Cancel();
+            stopwatch?.Stop();
             isScanning = false;
-
-            await Task.Delay(500); // 等待任务完成
+            await Task.Delay(500);
             lblStatus.Text = "上次扫描已停止";
         }
 
-        // 重置数据
         private void ResetData()
         {
-            fileQueue = new BlockingCollection<string>(); // 重新实例化队列
-            filesizeQueue = new BlockingCollection<string>(); // 重新实例化文件大小队列
-            fileSizeMap = new Dictionary<long, List<string>>(); // 清空文件大小映射表
-            md5ToFileMap = new Dictionary<string, List<string>>(); // 清空MD5映射表
-            displayedMd5s = new HashSet<string>(); // 清空已显示的MD5集合
+            fileQueue = new BlockingCollection<string>();
+            filesizeQueue = new BlockingCollection<string>();
+            fileSizeMap = new ConcurrentDictionary<long, ConcurrentBag<string>>();
+            md5ToFileMap = new ConcurrentDictionary<string, ConcurrentBag<string>>();
+            displayedMd5s = new HashSet<string>();
+            activeFileSizeThreads = 0;
         }
 
-        // 重置UI状态
         private void ResetUI()
         {
             listView1.Items.Clear();
@@ -90,7 +97,6 @@ namespace md5WinForms
             lblMd5Count.Text = "MD5 相同文件数量：0";
         }
 
-        // 更新扫描时间和MD5数量标签
         private async Task UpdateStatusLabels(CancellationToken token)
         {
             while (!token.IsCancellationRequested && isScanning)
@@ -103,30 +109,24 @@ namespace md5WinForms
                     lblScanTime.Text = $"扫描时间：{formattedTime}";
                     lblMd5Count.Text = $"MD5 相同文件数量：{GetDuplicateMd5Count()}";
                 }));
-                await Task.Delay(1000); // 每秒更新一次
+                await Task.Delay(1000);
             }
         }
 
-        // 每5秒刷新ListView
         private async Task PeriodicRefreshListView(CancellationToken token)
         {
             while (!token.IsCancellationRequested && isScanning)
             {
                 RefreshListView();
-                await Task.Delay(1000); // 每5秒刷新一次
+                await Task.Delay(1000);
             }
         }
 
-        // 获取MD5相同文件的数量
         private int GetDuplicateMd5Count()
         {
-            lock (md5ToFileMap)
-            {
-                return md5ToFileMap.Values.Count(v => v.Count > 1);
-            }
+            return md5ToFileMap.Values.Count(v => v.Count > 1);
         }
 
-        // 扫描文件并将文件路径添加到队列
         private void ScanFiles(string folderPath, CancellationToken token)
         {
             try
@@ -135,34 +135,28 @@ namespace md5WinForms
 
                 try
                 {
-                    // 尝试获取所有子目录中的文件
                     files = Directory.GetFiles(folderPath, "*.*", SearchOption.AllDirectories);
                 }
                 catch (UnauthorizedAccessException ex)
                 {
                     LogError($"将降级为递归扫描目录: {ex.Message}");
-                    files = ScanFilesTopDirectoryOnly(folderPath, token); // 降级为递归扫描
-                }
-                catch (IOException ex)
-                {
-                    LogError($"IO 异常: {ex.Message}");
+                    files = ScanFilesTopDirectoryOnly(folderPath, token);
                 }
                 catch (Exception ex)
                 {
-                    LogError($"其他异常: {ex.Message}");
-                    // 出错时跳过该目录
+                    LogError($"扫描异常: {ex.Message}");
+                    return;
                 }
 
-                // 将文件加入队列，处理取消令牌
                 foreach (var file in files)
                 {
                     if (token.IsCancellationRequested) break;
-                    fileQueue.Add(file); // 添加文件到队列
+                    fileQueue.Add(file);
                 }
             }
             finally
             {
-                fileQueue.CompleteAdding(); // 通知消费者不再有新的文件
+                fileQueue.CompleteAdding();
             }
         }
 
@@ -172,138 +166,187 @@ namespace md5WinForms
 
             try
             {
-                // 获取当前目录下的文件
                 files.AddRange(Directory.GetFiles(folderPath, "*.*", SearchOption.TopDirectoryOnly));
-            }
-            catch (Exception ex)
-            {
-                LogError($"降级扫描时发生异常: {ex.Message}");
-                // 跳过该目录
-            }
 
-            // 获取所有子目录并递归扫描
-            try
-            {
                 foreach (var subDirectory in Directory.GetDirectories(folderPath))
                 {
                     if (token.IsCancellationRequested) break;
-
-                    // 递归获取子目录中的文件
                     files.AddRange(ScanFilesTopDirectoryOnly(subDirectory, token));
                 }
             }
-            catch (UnauthorizedAccessException ex)
-            {
-                LogError($"无法访问子目录: {ex.Message}");
-            }
-            catch (IOException ex)
-            {
-                LogError($"IO 异常: {ex.Message}");
-            }
             catch (Exception ex)
             {
-                LogError($"其他异常: {ex.Message}");
+                LogError($"递归扫描异常: {ex.Message}");
             }
 
             return files;
         }
 
-
-
-        // 消费文件队列并将其添加到文件大小队列
+        // 修复：使用原子操作来管理线程完成状态
         private async Task ProcessFilesizeQueue(CancellationToken token)
         {
-            while (!fileQueue.IsCompleted)
+            try
             {
-                try
+                while (!fileQueue.IsCompleted && !token.IsCancellationRequested)
                 {
-                    if (!fileQueue.TryTake(out var filePath, Timeout.Infinite, token)) continue;
-
-                    FileInfo fileInfo = new FileInfo(filePath);
-                    long fileSize = fileInfo.Length;
-
-                    lock (fileSizeMap)
+                    try
                     {
-                        if (!fileSizeMap.ContainsKey(fileSize))
-                        {
-                            fileSizeMap[fileSize] = new List<string>();
-                        }
+                        if (!fileQueue.TryTake(out var filePath, 100, token)) continue;
 
-                        fileSizeMap[fileSize].Add(filePath);
+                        FileInfo fileInfo = new FileInfo(filePath);
+                        long fileSize = fileInfo.Length;
 
-                        // 如果文件大小已存在且数量大于1，添加所有文件到文件大小队列
-                        if (fileSizeMap[fileSize].Count == 2)
-                        {
-                            foreach (var file in fileSizeMap[fileSize])
+                        // 使用ConcurrentDictionary的线程安全方法
+                        fileSizeMap.AddOrUpdate(fileSize, 
+                            new ConcurrentBag<string> { filePath },
+                            (key, existingBag) =>
                             {
-                                filesizeQueue.Add(file);
-                            }
-                        }
-                        else if (fileSizeMap[fileSize].Count > 2)
-                        {
-                            filesizeQueue.Add(filePath);
-                        }
+                                existingBag.Add(filePath);
+                                
+                                // 当文件数量>=2时，将所有文件添加到处理队列
+                                if (existingBag.Count >= 2)
+                                {
+                                    // 只有在刚好等于2时才添加所有文件，避免重复添加
+                                    if (existingBag.Count == 2)
+                                    {
+                                        foreach (var file in existingBag)
+                                        {
+                                            filesizeQueue.Add(file);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // 大于2时只添加当前文件
+                                        filesizeQueue.Add(filePath);
+                                    }
+                                }
+                                
+                                return existingBag;
+                            });
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        LogError($"处理文件大小时出错: {ex.Message}");
                     }
                 }
-                catch (OperationCanceledException)
+            }
+            finally
+            {
+                // 使用原子操作来减少活跃线程计数
+                if (Interlocked.Decrement(ref activeFileSizeThreads) == 0)
                 {
-                    break;
+                    // 最后一个线程负责标记完成
+                    filesizeQueue.CompleteAdding();
                 }
             }
-
-            filesizeQueue.CompleteAdding(); // 通知消费者不再有新的文件
         }
 
-        // 消费文件大小队列并计算MD5
         private async Task ProcessFiles(CancellationToken token)
         {
-            while (!filesizeQueue.IsCompleted)
+            int numTasks = Environment.ProcessorCount;
+            var tasks = new List<Task>();
+
+            for (int i = 0; i < numTasks; i++)
             {
-                try
+                tasks.Add(Task.Run(async () =>
                 {
-                    if (!filesizeQueue.TryTake(out var filePath, Timeout.Infinite, token)) continue;
+                    var batchFiles = new List<string>();
+                    const int batchSize = 1000;
 
-                    string md5Hash = CalculateMD5(filePath);
-
-                    lock (md5ToFileMap)
+                    try
                     {
-                        if (!md5ToFileMap.ContainsKey(md5Hash))
+                        while (!token.IsCancellationRequested)
                         {
-                            md5ToFileMap[md5Hash] = new List<string>();
-                        }
+                            // 尝试取文件，设置超时避免无限等待
+                            if (filesizeQueue.TryTake(out var filePath, 100, token))
+                            {
+                                batchFiles.Add(filePath);
 
-                        md5ToFileMap[md5Hash].Add(filePath);
+                                // 达到批量大小或超时处理
+                                if (batchFiles.Count >= batchSize)
+                                {
+                                    await ProcessBatch(batchFiles, token);
+                                    batchFiles.Clear();
+                                }
+                            }
+                            else if (filesizeQueue.IsCompleted)
+                            {
+                                // 队列完成，处理剩余文件并退出
+                                if (batchFiles.Count > 0)
+                                {
+                                    await ProcessBatch(batchFiles, token);
+                                }
+                                break;
+                            }
+                        }
                     }
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    LogError($"无法读取文件: {ex.Message}");
-                }
+                    catch (OperationCanceledException)
+                    {
+                        // 取消操作，处理剩余文件
+                        if (batchFiles.Count > 0 && !token.IsCancellationRequested)
+                        {
+                            await ProcessBatch(batchFiles, token);
+                        }
+                    }
+                }, token));
             }
 
-            await Task.Run(() => FinalizeProcessing());
+            await Task.WhenAll(tasks);
+            FinalizeProcessing();
         }
 
-        // 最终处理和刷新UI
+        private async Task ProcessBatch(List<string> batchFiles, CancellationToken token)
+        {
+            if (batchFiles.Count == 0 || token.IsCancellationRequested) return;
+
+            try
+            {
+                // 使用您的MD5工具类
+                string[] md5Results = MD5UtilsRust.CalculateMD5FromFiles(batchFiles.ToArray());
+                
+                for (int j = 0; j < batchFiles.Count && j < md5Results.Length; j++)
+                {
+                    if (token.IsCancellationRequested) break;
+
+                    string md5Hash = md5Results[j];
+                    string file = batchFiles[j];
+                    
+                    // 使用ConcurrentDictionary的线程安全方法
+                    md5ToFileMap.AddOrUpdate(md5Hash,
+                        new ConcurrentBag<string> { file },
+                        (key, existingBag) =>
+                        {
+                            existingBag.Add(file);
+                            return existingBag;
+                        });
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError($"批量处理MD5时出错: {ex.Message}");
+            }
+        }
+
         private void FinalizeProcessing()
         {
-            Invoke(new Action(() =>
+            if (InvokeRequired)
             {
-                RefreshListView(); // 最后一次刷新
-                isScanning = false;
-                stopwatch.Stop();
-                lblStatus.Text = "扫描完成";
-                lblMd5Count.Text = $"MD5 相同文件数量：{GetDuplicateMd5Count()}";
-                // 弹出提示框通知用户扫描完成
-                MessageBox.Show("扫描已完成！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }));
+                Invoke(new Action(FinalizeProcessing));
+                return;
+            }
+
+            RefreshListView();
+            isScanning = false;
+            stopwatch.Stop();
+            lblStatus.Text = "扫描完成";
+            lblMd5Count.Text = $"MD5 相同文件数量：{GetDuplicateMd5Count()}";
+            MessageBox.Show("扫描已完成！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
-        // 计算文件的MD5
         private string CalculateMD5(string filePath)
         {
             using var md5 = MD5.Create();
@@ -312,7 +355,6 @@ namespace md5WinForms
             return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
         }
 
-        // 日志记录函数
         private void LogError(string message)
         {
             string logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "error_log.txt");
@@ -328,7 +370,6 @@ namespace md5WinForms
             }
         }
 
-        // 保存结果到CSV
         private void btnSave_Click(object sender, EventArgs e)
         {
             using var saveFileDialog = new SaveFileDialog { Filter = "CSV 文件 (*.csv)|*.csv" };
@@ -338,7 +379,6 @@ namespace md5WinForms
             }
         }
 
-        // 保存ListView内容到CSV文件
         private void SaveResultsToFile(string filePath)
         {
             var csvContent = new StringBuilder();
@@ -355,7 +395,6 @@ namespace md5WinForms
             MessageBox.Show("MD5 对照表已保存！", "保存成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
-        // 刷新ListView
         private void RefreshListView()
         {
             if (InvokeRequired)
@@ -364,16 +403,17 @@ namespace md5WinForms
                 return;
             }
 
-            lock (md5ToFileMap)
+            lock (displayedMd5s)
             {
                 foreach (var kvp in md5ToFileMap.Where(kvp => kvp.Value.Count > 1))
                 {
                     if (displayedMd5s.Contains(kvp.Key)) continue;
 
-                    var item = new ListViewItem(kvp.Value[0]);
-                    item.SubItems.Add(kvp.Value.Count > 1 ? kvp.Value[1] : "无");
+                    var fileList = kvp.Value.ToList();
+                    var item = new ListViewItem(fileList[0]);
+                    item.SubItems.Add(fileList.Count > 1 ? fileList[1] : "无");
                     item.SubItems.Add(kvp.Key);
-                    item.SubItems.Add(kvp.Value.Count > 2 ? "是" : "否");
+                    item.SubItems.Add(fileList.Count > 2 ? "是" : "否");
                     listView1.Items.Add(item);
 
                     displayedMd5s.Add(kvp.Key);
